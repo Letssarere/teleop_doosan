@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'sample_python_act = teleop_doosan.sample_python_act:main',
+            'sample_joint_rt = teleop_doosan.sample_joint_rt:main',
         ],
     },
 )
