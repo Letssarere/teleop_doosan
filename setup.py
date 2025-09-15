@@ -20,6 +20,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'sample_python_act = teleop_doosan.sample_python_act:main',
         ],
     },
 )
