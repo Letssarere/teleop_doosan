@@ -13,9 +13,6 @@ DR_init.__dsr__model = ROBOT_MODEL
 def wait_for_sub(node, topic, timeout=3.0):
     start = time.time()
     while time.time() - start < timeout and rclpy.ok():
-        info = node.get_topic_names_and_types()
-        # 간단히 topic 존재만 확인 후 ros2 topic info 를 대체
-        pubs = node.count_publishers(topic)
         subs = node.count_subscribers(topic)
         if subs > 0:
             return True
@@ -24,80 +21,66 @@ def wait_for_sub(node, topic, timeout=3.0):
 
 def main():
     rclpy.init()
-    node = rclpy.create_node("sample_servoj_debug", namespace=ROBOT_ID)
+    node = rclpy.create_node("sample_servoj_stream", namespace=ROBOT_ID)
     DR_init.__dsr__node = node
 
     from DSR_ROBOT2 import (
         get_current_posj,
         get_robot_state,
         servoj,
+        movej,
         set_velj,
         set_accj,
         DR_SERVO_OVERRIDE,
-        DR_COND_NONE,
     )
 
-    # 1. discovery 및 구독자 대기
+    # 1. 초기 대기
     node.get_logger().info("Discovery 대기...")
-    rclpy.spin_once(node, timeout_sec=0.2)
+    rclpy.spin_once(node, timeout_sec=0.3)
 
-    # (선택) servo stream subscriber 대기
+    # 2. 구독자 존재 확인 (참고용: 없어도 진행)
     if not wait_for_sub(node, "servoj_stream", timeout=2.0):
-        node.get_logger().warn("servoj_stream 구독자 확인 실패(계속 진행). dsr_control2가 구독 중인지 ros2 topic info로 재확인 요망.")
+        node.get_logger().warn("servoj_stream 구독자 감지 못함. ros2 topic info /dsr01/servoj_stream 로 재확인 필요.")
 
-    # 2. 로봇 상태 확인
+    # 3. 로봇 상태
     try:
-        state = get_robot_state()
-        node.get_logger().info(f"robot_state(raw)={state}")
+        st = get_robot_state()
+        node.get_logger().info(f"robot_state(raw)={st}")
     except Exception as e:
-        node.get_logger().warn(f"로봇 상태 조회 실패: {e}")
+        node.get_logger().warn(f"get_robot_state 실패: {e}")
 
-    # 3. 기본 속도/가속도 세팅 (global)
+    # 4. 속도/가속도 기본값
     try:
-        set_velj(60)   # 모든 관절 동일 속도 제한
+        set_velj(60)
         set_accj(300)
     except Exception as e:
         node.get_logger().warn(f"set_velj/set_accj 실패: {e}")
 
-    # 4. 현재 관절
+    # 5. 현재 관절
     pos0 = get_current_posj()
     if not pos0:
-        node.get_logger().error("현재 관절을 읽지 못했습니다.")
-        node.destroy_node()
-        rclpy.shutdown()
-        return
-    node.get_logger().info(f"Start pos: {pos0}")
+        node.get_logger().error("현재 관절 읽기 실패.")
+        node.destroy_node(); rclpy.shutdown(); return
+    node.get_logger().info(f"Init pos: {pos0}")
 
-    # 5. 단일 servoj 테스트 (time=2.0 으로 명확히 이동)
-    test_target = list(pos0)
-    test_target[0] = pos0[0] + 10.0  # 10deg 이동
-    node.get_logger().info(f"[단일 이동] J0 +10deg -> {test_target}")
-    servoj(test_target, t=2.0, mode=DR_SERVO_OVERRIDE)
-    time.sleep(2.2)
-    rclpy.spin_once(node, timeout_sec=0.0)
-    pos_after = get_current_posj()
-    node.get_logger().info(f"단일 이동 후 관절: {pos_after}")
+    # 6. (중요) movej 로 먼저 활성화 (INIT 상태라면)
+    warm_target = list(pos0)
+    warm_target[0] = pos0[0] + 5.0  # 5도 이동
+    node.get_logger().info("워밍업 movej 실행 (스트리밍 적용 전 상태 활성화)")
+    try:
+        movej(warm_target, v=30, a=30, t=2.0)
+        movej(pos0, v=30, a=30, t=2.0)
+    except Exception as e:
+        node.get_logger().warn(f"movej 워밍업 실패: {e}")
 
-    moved = (pos_after and abs(pos_after[0] - pos0[0]) > 5.0)
-    if not moved:
-        node.get_logger().error("단일 servoj 이동 반영 안 됨. (1) 구독자/네임스페이스 (2) 드라이버 버전 (3) 모션 점유 상태 확인 필요.")
-        node.destroy_node()
-        rclpy.shutdown()
-        return
-
-    # 원위치 복귀
-    node.get_logger().info("원위치 복귀")
-    servoj(pos0, t=2.0, mode=DR_SERVO_OVERRIDE)
-    time.sleep(2.2)
-
-    # 6. 스트리밍 사인파 (time=0 사용)
+    # 7. 스트리밍 설정
     freq = 100.0
     dt = 1.0 / freq
     run_time = 8.0
     amp_deg = 5.0
     sine_freq = 0.3
 
-    node.get_logger().info("사인파 스트리밍 시작 (time=0, override) ...")
+    node.get_logger().info("servoj 스트리밍 시작 (연속 publish, override). 단발 호출로는 움직이지 않습니다.")
     t_start = time.perf_counter()
     next_tick = t_start
     count = 0
@@ -109,18 +92,19 @@ def main():
             elapsed = now - t_start
             if elapsed >= run_time:
                 break
+
             phase = 2.0 * math.pi * sine_freq * elapsed
             target = list(pos0)
             target[0] = pos0[0] + amp_deg * math.sin(phase)
 
-            # time=0 권장 테스트 (내부 즉시 반영 성격)
-            servoj(target, t=0.0, mode=DR_SERVO_OVERRIDE)
+            # 연속 스트리밍: time=dt (혹은 0.0 도 가능) / override
+            servoj(target, t=dt, mode=DR_SERVO_OVERRIDE)
 
             rclpy.spin_once(node, timeout_sec=0.0)
 
             if now - last_log >= 1.0 and count > 0:
                 eff_hz = count / (now - t_start)
-                node.get_logger().info(f"Streaming Hz≈{eff_hz:.1f}")
+                node.get_logger().info(f"Sent={count}, Hz≈{eff_hz:.1f}")
                 last_log = now
 
             next_tick += dt
@@ -128,12 +112,13 @@ def main():
             if sleep_time > 0:
                 time.sleep(sleep_time)
             else:
+                # 지터 누적 방지 재동기
                 next_tick = time.perf_counter()
             count += 1
     except KeyboardInterrupt:
         node.get_logger().info("Interrupted")
 
-    # 마지막 위치 유지
+    # 8. 종료 안정화: 마지막 위치 유지
     final_pos = get_current_posj()
     if final_pos:
         servoj(final_pos, t=0.05, mode=DR_SERVO_OVERRIDE)
